@@ -50,7 +50,6 @@ class CaseLists extends React.Component {
       isAdd: true,
       isReName: true,
       treeSelect: [],
-      treeData: [],
     };
   }
   componentDidMount() {
