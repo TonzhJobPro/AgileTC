@@ -1,26 +1,30 @@
 package com.xiaoju.framework.handler;
 
-import com.alibaba.fastjson.JSON;
-import com.alibaba.fastjson.JSONArray;
-import com.alibaba.fastjson.JSONObject;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.flipkart.zjsonpatch.JsonDiff;
+import com.flipkart.zjsonpatch.JsonPatch;
 import com.xiaoju.framework.entity.persistent.TestCase;
 import com.xiaoju.framework.mapper.TestCaseMapper;
 import com.xiaoju.framework.service.CaseBackupService;
 import com.xiaoju.framework.service.RecordService;
 import com.xiaoju.framework.util.BitBaseUtil;
-import com.xiaoju.framework.util.TreeUtil;
 import org.apache.poi.util.StringUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.util.StringUtils;
 
-import javax.annotation.Resource;
 import javax.websocket.Session;
-import java.awt.*;
 import java.util.*;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
+
+import static com.flipkart.zjsonpatch.DiffFlags.ADD_ORIGINAL_VALUE_ON_REPLACE;
+import static com.flipkart.zjsonpatch.DiffFlags.OMIT_MOVE_OPERATION;
 
 /**
  * Created by didi on 2021/3/22.
@@ -40,11 +44,20 @@ public abstract class Room {
 
     private static final int MAX_PLAYER_COUNT = 100;
     public final List<Player> players = new ArrayList<>();
+
+    public final List<String> undoDiffs = new LinkedList<>();
+    public final List<String> redoDiffs = new LinkedList<>();
+    private Integer undoPosition;
+    private Integer redoPosition;
+
     public final Map<Session, Client> cs = new ConcurrentHashMap<>();
 
     public static TestCaseMapper caseMapper;
     public static RecordService recordService;
     public static CaseBackupService caseBackupService;
+
+    ObjectMapper jsonMapper = new ObjectMapper();
+    JsonNodeFactory FACTORY = JsonNodeFactory.instance;
 
     protected String testCaseContent;
     protected TestCase testCase;
@@ -77,6 +90,8 @@ public abstract class Room {
         if (StringUtils.isEmpty(res)) {
             LOGGER.error(Thread.currentThread().getName() + ": 用例内容为空");
         }
+        undoPosition = undoDiffs.size();
+        redoPosition = redoDiffs.size();
     }
 
     private TimerTask createBroadcastTimerTask() {
@@ -106,7 +121,7 @@ public abstract class Room {
         Player p = new Player(this, client);
 
         // 通知消息
-        broadcastRoomMessage( "当前用户数： " + (players.size() + 1) + "。新用户是：" + client.getClientName());
+        broadcastRoomMessage(CaseMessageType.NOTIFY, "当前用户数： " + (players.size() + 1) + "。新用户是：" + client.getClientName());
 
         players.add(p);
         cs.put(client.getSession(), client);
@@ -120,7 +135,7 @@ public abstract class Room {
 
         // 发送当前用户数
         String content = String.valueOf(players.size());
-        p.sendRoomMessageSync("当前用户数：" + content);
+        p.sendRoomMessageSync(CaseMessageType.NOTIFY, "当前用户数：" + content);
 
         return p;
     }
@@ -147,9 +162,10 @@ public abstract class Room {
     }
 
     // 直接广播发送内容，不经过buffer池。适用于所有消息都是一致的场景。
-    protected void broadcastRoomMessage(String content) {
+    protected void broadcastRoomMessage(CaseMessageType type, String content) {
+
         for (Player p : players) {
-            p.sendRoomMessageSync(content);
+            p.sendRoomMessageSync(type, content);
         }
     }
 
@@ -158,8 +174,44 @@ public abstract class Room {
         p.setLastReceivedMessageId(msgId);
 
         //todo: testCase.apply(msg) 新增如上的方法.
+        if (msg.endsWith("undo")) {
+            undo();
+        } else if (msg.endsWith("redo")) {
+            redo();
+        } else {
+            broadcastMessage(msg);
+        }
+    }
 
-        broadcastMessage(msg);
+    private void undo() {
+        roomLock.lock();
+        undoPosition --;
+        redoPosition --;
+        broadcastRoomMessage(CaseMessageType.EDITOR, undoDiffs.get(undoPosition));
+        try {
+            JsonNode target = JsonPatch.apply(jsonMapper.readTree(undoDiffs.get(undoPosition)), jsonMapper.readTree(testCaseContent));
+            testCaseContent = target.toString();
+        } catch (Exception e) {
+            roomLock.unlock();
+            LOGGER.error("undo json parse error。", e);
+        }
+        roomLock.unlock();
+    }
+
+    private void redo() {
+        roomLock.lock();
+        broadcastRoomMessage(CaseMessageType.EDITOR, redoDiffs.get(redoPosition));
+        try {
+            JsonNode target = JsonPatch.apply(jsonMapper.readTree(redoDiffs.get(undoPosition)), jsonMapper.readTree(testCaseContent));
+            testCaseContent = target.toString();
+        } catch (Exception e) {
+            roomLock.unlock();
+            LOGGER.error("redo json parse error。", e);
+        }
+
+        undoPosition ++;
+        redoPosition ++;
+        roomLock.unlock();
     }
 
     private void internalHandleCtrlMessage(String msg) {
@@ -184,25 +236,58 @@ public abstract class Room {
             for (Player p : players) {
                 String s = String.valueOf(p.getLastReceivedMessageId())
                         + "," + msgStr;
-                p.sendRoomMessageSync(s); // 直接发送，不放到buffer
+                p.sendRoomMessageSync(CaseMessageType.EDITOR, s); // 直接发送，不放到buffer
             }
         } else {
             int seperateIndex = msg.indexOf('|');
             String sendSessionId = msg.substring(0, seperateIndex);
-            JSONObject request = JSON.parseObject(msg.substring(seperateIndex + 1));
-            JSONArray patch = (JSONArray) request.get("patch");
-            long currentVersion = ((JSONObject) request.get("case")).getLong("base");
-            testCaseContent = ((JSONObject) request.get("case")).toJSONString().replace("\"base\":" + currentVersion, "\"base\":" + (currentVersion + 1));
-            for (Player p : players) {
-                if (sendSessionId.equals(p.getClient().getSession().getId())) { //ack消息
-                    String msgAck = "[[{\"op\":\"replace\",\"path\":\"/base\",\"value\":" + (currentVersion + 1) + "}]]";
-                    p.getBufferedMessages().add(msgAck);
-                } else { // notify消息
-                    String msgNotify = patch.toJSONString().replace("[[{", "[[{\"op\":\"replace\",\"path\":\"/base\",\"value\":" + (currentVersion + 1) + "},{");
-                    p.getBufferedMessages().add(msgNotify);
+            try {
+                JsonNode request = jsonMapper.readTree(msg.substring(seperateIndex + 1));
+                ArrayNode patch = (ArrayNode) request.get("patch");
+                long currentVersion = ((JsonNode) request.get("case")).get("base").asLong();
+                String tmpTestCaseContent = ((JsonNode) request.get("case")).toString().replace("\"base\":" + currentVersion, "\"base\":" + (currentVersion + 1));;
+                ArrayNode patchReverse = (ArrayNode) JsonDiff.asJson(jsonMapper.readTree(tmpTestCaseContent),
+                        jsonMapper.readTree(testCaseContent==null?testCase.getCaseContent():testCaseContent), EnumSet.of(ADD_ORIGINAL_VALUE_ON_REPLACE, OMIT_MOVE_OPERATION));
+
+                testCaseContent = tmpTestCaseContent;
+                ArrayNode patchNew = patchTraverse(patch);
+
+                ObjectNode basePatch = FACTORY.objectNode();
+                basePatch.put("op", "replace");
+                basePatch.put("path", "/base");
+                basePatch.put("value", currentVersion + 1);
+                patchNew.add(basePatch);
+//                String msgNotify = patch.toString().replace("[[{", "[[{\"op\":\"replace\",\"path\":\"/base\",\"value\":" + (currentVersion + 1) + "},{");
+                redoDiffs.add(redoPosition++, patchNew.toString());
+                undoDiffs.add(undoPosition++, patchReverse.toString());
+
+                for (Player p : players) {
+                    if (sendSessionId.equals(p.getClient().getSession().getId())) { //ack消息
+                        String msgAck = "[[{\"op\":\"replace\",\"path\":\"/base\",\"value\":" + (currentVersion + 1) + "}]]";
+                        p.getBufferedMessages().add(msgAck);
+                        p.undoCount ++;
+                    } else { // notify消息
+//                        String msgNotify = patch.toString().replace("[[{", "[[{\"op\":\"replace\",\"path\":\"/base\",\"value\":" + (currentVersion + 1) + "},{");
+                        p.getBufferedMessages().add(patchNew.toString());
+                        p.undoCount ++;
+                    }
                 }
+            } catch (Exception e) {
+                LOGGER.error("json 操作失败。", e);
             }
         }
+    }
+
+    private ArrayNode patchTraverse(ArrayNode patch) {
+        ArrayNode patchesNew = FACTORY.arrayNode();
+        try {
+            for (int i = 0; i < patch.size(); i++) {
+                patchesNew.addAll((ArrayNode) patch.get(i));
+            }
+        } catch (Exception e) {
+            LOGGER.error("转换客户端发送patch失败。", e);
+        }
+        return patchesNew;
     }
 
     private void broadcastTimerTick() {
@@ -227,7 +312,7 @@ public abstract class Room {
 
                 caseMessages.clear();
 
-                p.sendRoomMessageSync(sb.toString());
+                p.sendRoomMessageSync(CaseMessageType.EDITOR, sb.toString());
             }
         }
 
@@ -293,6 +378,13 @@ public abstract class Room {
         private final Client client;
         private final long enterTimeStamp;
 
+        private Integer pingCount;
+
+//        private Integer undoPosition;
+//        private Integer redoPosition;
+        private Integer undoCount;
+        private Integer redoCount;
+
 //        private final boolean isRecord;
 
         /**
@@ -304,11 +396,48 @@ public abstract class Room {
             return bufferedMessages;
         }
 
+        public boolean isPingNormal() {
+            return pingCount <= 2;
+        }
+
+        public void clearPingCount() {
+            this.pingCount = 0;
+        }
+
         private Player(Room room, Client client) {
             this.room = room;
             this.client = client;
             this.enterTimeStamp = System.currentTimeMillis();
+            this.pingCount = 0;
+//            this.undoPosition = room.undoDiffs.size();
+//            this.redoPosition = room.redoDiffs.size();
+            this.undoCount = 0;
+            this.redoCount = 0;
 //            isRecord = client.getRecordId();
+        }
+
+        public Boolean undo() {
+            if (this.undoCount <= 0) {
+                LOGGER.warn("当前用户未编辑过，无法进行undo。用户是：" + this.client.getClientName());
+                return false;
+            }
+            this.undoCount --;
+//            this.undoPosition --;
+            this.redoCount ++;
+//            this.redoPosition --;
+            return true;
+        }
+
+        public Boolean redo() {
+            if (this.redoCount <= 0) {
+                LOGGER.warn("当前用户未undo过，无法进行redo。用户是：" + this.client.getClientName());
+                return false;
+            }
+            this.undoCount ++;
+//            this.undoPosition ++;
+            this.redoCount --;
+//            this.redoPosition ++;
+            return true;
         }
 
         public Room getRoom() {
@@ -356,10 +485,16 @@ public abstract class Room {
          * 发送room的消息
          * @param content
          */
-        public void sendRoomMessageSync(String content) {
+        public void sendRoomMessageSync(CaseMessageType type, String content) {
             Objects.requireNonNull(content);
-
-            client.sendMessage(content);
+            if (content.equals(CaseWsMessages.PING.getMsg())) {
+                this.pingCount ++;
+                if (!isPingNormal()) {
+                    LOGGER.error("服务端ping客户端3次失败，当前用户连接有问题：" + this.getClient().getClientName());
+                    throw new RuntimeException("心跳错误，客户端与服务端连接错误");
+                }
+            }
+            client.sendMessage(type, content);
         }
 
         public void sendRoomMessageAsync(String content) {
